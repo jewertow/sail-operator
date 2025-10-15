@@ -242,10 +242,22 @@ spec:
 EOF
 ----
 
-**Key Configuration Options:**
+[IMPORTANT]
+====
+The `meshConfig.tlsDefaults.ecdhCurves` setting applies to **all non-mesh TLS connections** in your Istio deployment. This includes:
 
-* `accessLogFile: /dev/stdout`: Enables access logging for debugging and monitoring
-* `ecdhCurves: [X25519MLKEM768]`: Configures the mesh to use the hybrid post-quantum key exchange algorithm
+* **Ingress gateways**: TLS connections from external clients to your gateways
+* **Egress gateways**: TLS connections from your gateways to external services
+* **External service connections**: Any TLS connections to services outside the mesh
+
+However, this setting does **NOT** apply to:
+
+* **Mesh-internal mTLS**: Communication between services within the mesh continues to use Istio's default mTLS configuration
+
+Currently, Istio does not provide the capability to enable post-quantum cryptography algorithms on a per-workload basis. The `tlsDefaults` configuration is a mesh-wide setting that affects all gateways and external TLS connections uniformly.
+
+If you need different TLS configurations for different gateways, you would need to deploy separate Istio control planes with different `meshConfig.tlsDefaults` settings.
+====
 
 ==== Generate TLS Certificates
 
