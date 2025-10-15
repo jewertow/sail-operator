@@ -90,7 +90,18 @@ oc apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.
 [[customize-istio-proxy-image]]
 === Customize istio-proxy Image
 
-OpenShift Service Mesh 3.1 does not deliver an istio-proxy image with built-in support for Post-Quantum Cryptography. To enable post-quantum safe algorithms, you need to configure the https://github.com/open-quantum-safe/oqs-provider[OQS (Open Quantum Safe) provider] in the proxy container.
+OpenShift Service Mesh 3.1 delivers an istio-proxy image built with OpenSSL 3.2 that supports Post-Quantum Cryptography algorithms through the [OQS (Open Quantum Safe) provider](https://github.com/open-quantum-safe/oqs-provider).
+However, RHEL 9.6 does not currently provide the OQS provider package, so users must build and integrate it manually into their proxy images.
+Future versions of OpenShift Service Mesh will ship with an updated a newer version of OpenSSL with built-in support for PQC algorithms. This will remove the need for users to manually build and integrate the OQS provider, simplifying the deployment of quantum-secure gateways. Users will be able to leverage hybrid and PQC-only cryptographic algorithms in their gateways without requiring custom proxy images or manual OpenSSL configuration.
+
+Until these future releases become generally available, follow the steps below to build your own quantum-safe istio-proxy image.
+
+[NOTE]
+====
+Post-Quantum Cryptography algorithms will be available out-of-the-box in future releases of OpenShift Service Mesh, eliminating the need for custom proxy images.
+====
+
+To enable post-quantum safe algorithms in the current release, you need to create a custom istio-proxy image with the OQS provider configured.
 
 ==== Build Custom Proxy Image
 
