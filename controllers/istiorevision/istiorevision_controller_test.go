@@ -17,19 +17,25 @@ package istiorevision
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/istio-ecosystem/sail-operator/api/v1"
 	"github.com/istio-ecosystem/sail-operator/pkg/config"
 	"github.com/istio-ecosystem/sail-operator/pkg/constants"
+	"github.com/istio-ecosystem/sail-operator/pkg/helm"
 	"github.com/istio-ecosystem/sail-operator/pkg/istioversion"
 	sharedreconcile "github.com/istio-ecosystem/sail-operator/pkg/reconcile"
 	"github.com/istio-ecosystem/sail-operator/pkg/reconciler"
 	"github.com/istio-ecosystem/sail-operator/pkg/scheme"
 	"github.com/istio-ecosystem/sail-operator/pkg/test/podwatch"
 	. "github.com/onsi/gomega"
+	"helm.sh/helm/v4/pkg/release"
+	releasecommon "helm.sh/helm/v4/pkg/release/common"
+	releasev1 "helm.sh/helm/v4/pkg/release/v1"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -127,6 +133,145 @@ func TestReconcile(t *testing.T) {
 			t.Errorf("Expected Reconciled condition message to contain %q, but got %q", "failed to resolve Istio version", reconciledCond.Message)
 		}
 	})
+
+	t.Run("reconciles chart on drift", func(t *testing.T) {
+		rev := newReconcilableRevision(t, cfg)
+		chartManager := newRecordingChartReconciler()
+		cl := newReconciliationClient(rev, driftedIstiodDeployment())
+
+		r := NewReconciler(cfg, cl, scheme.Scheme, chartManager)
+		if _, err := r.Reconcile(context.Background(), rev); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		if chartManager.upgradeCount != 1 {
+			t.Errorf("Expected drift to trigger one Helm chart reconciliation, got %d", chartManager.upgradeCount)
+		}
+	})
+
+	t.Run("does not reconcile chart on pod change", func(t *testing.T) {
+		rev := newReconcilableRevision(t, cfg)
+		chartManager := newRecordingChartReconciler()
+		cl := newReconciliationClient(rev, expectedIstiodDeployment(), podReferencingRevision())
+
+		r := NewReconciler(cfg, cl, scheme.Scheme, chartManager)
+		if _, err := r.Reconcile(context.Background(), rev); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		if chartManager.upgradeCount != 0 {
+			t.Errorf("Expected a pod change not to trigger Helm chart reconciliation, got %d", chartManager.upgradeCount)
+		}
+
+		key := types.NamespacedName{Name: rev.Name}
+		if err := cl.Get(context.Background(), key, rev); err != nil {
+			t.Fatalf("Failed to get IstioRevision: %v", err)
+		}
+		if condition := rev.Status.GetCondition(v1.IstioRevisionConditionInUse); condition.Status != metav1.ConditionTrue {
+			t.Errorf("Expected pod change to update InUse to %q, got %q", metav1.ConditionTrue, condition.Status)
+		}
+	})
+}
+
+func newReconcilableRevision(t *testing.T, cfg config.ReconcilerConfig) *v1.IstioRevision {
+	t.Helper()
+	rev := &v1.IstioRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: "v1"},
+		Spec: v1.IstioRevisionSpec{
+			Version:   "v1.31.4",
+			Namespace: "istio-system",
+			Values: &v1.Values{
+				Revision: new("v1"),
+				Global:   &v1.GlobalConfig{IstioNamespace: new("istio-system")},
+			},
+		},
+	}
+	inputHash, err := HashChartInputs(ChartRenderInputsForRevision(cfg, rev))
+	if err != nil {
+		t.Fatalf("HashChartInputs() error = %v", err)
+	}
+	rev.Annotations = map[string]string{
+		ChartApplyInputHashAnnotation:           inputHash,
+		ChartApplyLastSuccessfulApplyAnnotation: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}
+	return rev
+}
+
+func newReconciliationClient(rev *v1.IstioRevision, objects ...client.Object) client.WithWatch {
+	return fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithStatusSubresource(&v1.IstioRevision{}).
+		WithObjects(append([]client.Object{
+			rev,
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "istio-system"}},
+		}, objects...)...).
+		Build()
+}
+
+func expectedIstiodDeployment() *appsv1.Deployment {
+	replicas := int32(1)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "istiod-v1", Namespace: "istio-system"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+	}
+}
+
+func driftedIstiodDeployment() *appsv1.Deployment {
+	deployment := expectedIstiodDeployment()
+	replicas := int32(2)
+	deployment.Spec.Replicas = &replicas
+	return deployment
+}
+
+func podReferencingRevision() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "workload",
+			Namespace:   "istio-system",
+			Annotations: map[string]string{"istio.io/rev": "v1"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+type recordingChartReconciler struct {
+	upgradeCount int
+	release      release.Releaser
+}
+
+func newRecordingChartReconciler() *recordingChartReconciler {
+	return &recordingChartReconciler{
+		release: &releasev1.Release{
+			Name:      "v1-istiod",
+			Namespace: "istio-system",
+			Version:   1,
+			Info:      &releasev1.Info{Status: releasecommon.StatusDeployed},
+			Config:    map[string]any{},
+			Manifest: `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: istiod-v1
+  namespace: istio-system
+spec:
+  replicas: 1
+`,
+		},
+	}
+}
+
+func (r *recordingChartReconciler) UpgradeOrInstallChart(
+	context.Context, fs.FS, string, helm.Values, string, string, *metav1.OwnerReference,
+) (release.Releaser, error) {
+	r.upgradeCount++
+	return r.release, nil
+}
+
+func (r *recordingChartReconciler) UninstallChart(
+	context.Context, string, string,
+) (*release.UninstallReleaseResponse, error) {
+	return &release.UninstallReleaseResponse{}, nil
+}
+
+func (r *recordingChartReconciler) GetRelease(context.Context, string, string) (release.Releaser, error) {
+	return r.release, nil
 }
 
 func TestValidate(t *testing.T) {

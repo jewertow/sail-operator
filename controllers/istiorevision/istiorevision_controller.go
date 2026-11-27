@@ -62,10 +62,10 @@ type Reconciler struct {
 	client.Client
 	Config       config.ReconcilerConfig
 	Scheme       *runtime.Scheme
-	ChartManager *helm.ChartManager
+	ChartManager helm.ChartReconciler
 }
 
-func NewReconciler(cfg config.ReconcilerConfig, client client.Client, scheme *runtime.Scheme, chartManager *helm.ChartManager) *Reconciler {
+func NewReconciler(cfg config.ReconcilerConfig, client client.Client, scheme *runtime.Scheme, chartManager helm.ChartReconciler) *Reconciler {
 	return &Reconciler{
 		Config:       cfg,
 		Client:       client,
