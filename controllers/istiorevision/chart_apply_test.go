@@ -342,6 +342,7 @@ func TestShouldApplyChart(t *testing.T) {
 		},
 		{
 			name:       "deleted chart-owned resource applies immediately",
+			inputs:     inputs,
 			state:      applied,
 			drift:      ChartDrift{Detected: true},
 			wantApply:  true,
@@ -349,6 +350,7 @@ func TestShouldApplyChart(t *testing.T) {
 		},
 		{
 			name:       "edited chart-owned resource applies immediately",
+			inputs:     inputs,
 			state:      applied,
 			drift:      ChartDrift{Detected: true},
 			wantApply:  true,
@@ -356,6 +358,7 @@ func TestShouldApplyChart(t *testing.T) {
 		},
 		{
 			name:       "comparison error fails closed",
+			inputs:     inputs,
 			state:      applied,
 			drift:      ChartDrift{Err: errors.New("comparison failed")},
 			wantApply:  true,
@@ -363,7 +366,8 @@ func TestShouldApplyChart(t *testing.T) {
 		},
 		{
 			name:       "backstop due applies",
-			state:      withLastSuccessfulApply(applied, now.Add(DefaultChartBackstopInterval-time.Minute)),
+			inputs:     inputs,
+			state:      withLastSuccessfulApply(applied, now.Add(-(DefaultChartBackstopInterval + time.Minute))),
 			wantApply:  true,
 			wantReason: ChartApplyReasonBackstopDue,
 		},
@@ -427,8 +431,21 @@ func TestShouldApplyChartBackstopScheduling(t *testing.T) {
 
 func TestRecordSuccessfulChartApplyDoesNotChangeOnNoOp(t *testing.T) {
 	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
-	before := ChartApplyState{LastAppliedInputHash: "hash", LastSuccessfulApplyTime: now.Add(-time.Minute), ReleaseExists: true}
-	after := RecordSuccessfulChartApply(before, now.Add(time.Minute), "hash")
+	inputs := ChartRenderInputs{Version: "v1.31.0", RevisionName: "default"}
+	inputHash, err := HashChartInputs(inputs)
+	if err != nil {
+		t.Fatalf("HashChartInputs() error = %v", err)
+	}
+	before := ChartApplyState{LastAppliedInputHash: inputHash, LastSuccessfulApplyTime: now.Add(-time.Minute), ReleaseExists: true}
+
+	decision, err := ShouldApplyChart(now, inputs, before, ChartDrift{})
+	if err != nil {
+		t.Fatalf("ShouldApplyChart() error = %v", err)
+	}
+	after := before
+	if decision.Apply {
+		after = RecordSuccessfulChartApply(before, now.Add(time.Minute), inputHash)
+	}
 	if !reflect.DeepEqual(before, after) {
 		t.Errorf("RecordSuccessfulChartApply() changed state for an unchanged successful input: before %+v, after %+v", before, after)
 	}

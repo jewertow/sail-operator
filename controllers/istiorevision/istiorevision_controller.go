@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	v1 "github.com/istio-ecosystem/sail-operator/api/v1"
@@ -34,6 +36,8 @@ import (
 	"github.com/istio-ecosystem/sail-operator/pkg/revision"
 	"github.com/istio-ecosystem/sail-operator/pkg/validation"
 	"github.com/istio-ecosystem/sail-operator/pkg/watches"
+	releasecommon "helm.sh/helm/v4/pkg/release/common"
+	releasev1 "helm.sh/helm/v4/pkg/release/v1"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -88,40 +92,72 @@ func NewReconciler(cfg config.ReconcilerConfig, client client.Client, scheme *ru
 func (r *Reconciler) Reconcile(ctx context.Context, rev *v1.IstioRevision) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	reconcileErr := r.doReconcile(ctx, rev)
+	result, reconcileErr := r.doReconcile(ctx, rev)
 
 	log.Info("Reconciliation done. Updating status.")
 	statusErr := r.updateStatus(ctx, rev, reconcileErr)
 
-	return ctrl.Result{}, errors.Join(reconcileErr, statusErr)
+	return result, errors.Join(reconcileErr, statusErr)
 }
 
-func (r *Reconciler) doReconcile(ctx context.Context, rev *v1.IstioRevision) error {
+func (r *Reconciler) doReconcile(ctx context.Context, rev *v1.IstioRevision) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	istiodReconciler := r.newIstiodReconciler()
 
 	// CRD-specific validations
 	if err := r.validateRevisionConsistency(rev); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 	if err := r.validateNoTagConflict(ctx, rev); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 
 	revVersion, err := istioversion.Resolve(rev.Spec.Version)
 	if err != nil {
 		if istioversion.IsEOLVersion(rev.Spec.Version) {
-			return reconciler.NewValidationError(fmt.Sprintf("IstioRevision version %q is EOL and cannot be installed", rev.Spec.Version))
+			return ctrl.Result{}, reconciler.NewValidationError(fmt.Sprintf("IstioRevision version %q is EOL and cannot be installed", rev.Spec.Version))
 		}
-		return fmt.Errorf("failed to resolve Istio version %s: %w", rev.Spec.Version, err)
+		return ctrl.Result{}, fmt.Errorf("failed to resolve Istio version %s: %w", rev.Spec.Version, err)
 	}
 
 	// General validations
 	if err := istiodReconciler.Validate(ctx, revVersion, rev.Spec.Namespace, rev.Spec.Values); err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
 
-	log.Info("Installing Helm chart")
+	inputs := ChartRenderInputsForRevision(r.Config, rev)
+	inputHash, err := HashChartInputs(inputs)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to hash chart inputs: %w", err)
+	}
+
+	state, manifests, err := r.chartApplyState(ctx, rev)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	decision, err := ShouldApplyChart(time.Now(), inputs, state, ChartDrift{})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !decision.Apply {
+		expected, err := chartResourcesFromManifest(r.Scheme, manifests)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		drift, _ := DetectChartDrift(ctx, r.Client, expected)
+		decision, err = ShouldApplyChart(time.Now(), inputs, state, drift)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if !decision.Apply {
+		log.Info("Skipping Helm chart reconciliation", "reason", "NoChange")
+		return ctrl.Result{RequeueAfter: decision.RequeueAfter}, nil
+	}
+
+	log.Info("Installing Helm chart", "reason", decision.Reason)
 	ownerReference := metav1.OwnerReference{
 		APIVersion:         v1.GroupVersion.String(),
 		Kind:               v1.IstioRevisionKind,
@@ -130,7 +166,80 @@ func (r *Reconciler) doReconcile(ctx context.Context, rev *v1.IstioRevision) err
 		Controller:         new(true),
 		BlockOwnerDeletion: new(true),
 	}
-	return istiodReconciler.Install(ctx, revVersion, rev.Spec.Namespace, rev.Spec.Values, rev.Name, &ownerReference)
+	if err := istiodReconciler.Install(ctx, revVersion, rev.Spec.Namespace, rev.Spec.Values, rev.Name, &ownerReference); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	state = RecordSuccessfulChartApply(state, time.Now(), inputHash)
+	if err := r.writeChartApplyState(ctx, rev, state); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: DefaultChartBackstopInterval}, nil
+}
+
+func (r *Reconciler) chartApplyState(ctx context.Context, rev *v1.IstioRevision) (ChartApplyState, string, error) {
+	state := ChartApplyState{
+		LastAppliedInputHash: rev.Annotations[ChartApplyInputHashAnnotation],
+	}
+	if value := rev.Annotations[ChartApplyLastSuccessfulApplyAnnotation]; value != "" {
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return state, "", fmt.Errorf("failed to parse last successful chart apply time: %w", err)
+		}
+		state.LastSuccessfulApplyTime = parsed
+	}
+
+	releases := []struct {
+		namespace string
+		name      string
+	}{
+		{rev.Spec.Namespace, sharedreconcile.GetReleaseName(rev.Name, constants.IstiodChartName)},
+	}
+	if rev.Name == v1.DefaultRevision {
+		releases = append(releases, struct {
+			namespace string
+			name      string
+		}{r.Config.OperatorNamespace, sharedreconcile.GetReleaseName(rev.Name, constants.BaseChartName)})
+	}
+
+	manifests := make([]string, 0, len(releases))
+	state.ReleaseExists = true
+	for _, helmRelease := range releases {
+		releaseObject, err := r.ChartManager.GetRelease(ctx, helmRelease.namespace, helmRelease.name)
+		if err != nil {
+			return state, "", fmt.Errorf("failed to get Helm release %s/%s: %w", helmRelease.namespace, helmRelease.name, err)
+		}
+		if releaseObject == nil {
+			state.ReleaseExists = false
+			continue
+		}
+
+		releaseValue, ok := releaseObject.(*releasev1.Release)
+		if !ok {
+			return state, "", fmt.Errorf("unexpected Helm release type %T for %s/%s", releaseObject, helmRelease.namespace, helmRelease.name)
+		}
+		if releaseValue.Info == nil {
+			return state, "", fmt.Errorf("Helm release %s/%s has no status information", helmRelease.namespace, helmRelease.name)
+		}
+		switch releaseValue.Info.Status {
+		case releasecommon.StatusPendingInstall, releasecommon.StatusPendingUpgrade, releasecommon.StatusPendingRollback, releasecommon.StatusUninstalling:
+			state.ReleasePending = true
+		case releasecommon.StatusFailed:
+			state.ReleaseFailed = true
+		}
+		manifests = append(manifests, releaseValue.Manifest)
+	}
+	return state, strings.Join(manifests, "\n---\n"), nil
+}
+
+func (r *Reconciler) writeChartApplyState(ctx context.Context, rev *v1.IstioRevision, state ChartApplyState) error {
+	before := rev.DeepCopy()
+	if rev.Annotations == nil {
+		rev.Annotations = make(map[string]string)
+	}
+	rev.Annotations[ChartApplyInputHashAnnotation] = state.LastAppliedInputHash
+	rev.Annotations[ChartApplyLastSuccessfulApplyAnnotation] = state.LastSuccessfulApplyTime.UTC().Format(time.RFC3339)
+	return r.Patch(ctx, rev, client.MergeFrom(before))
 }
 
 func (r *Reconciler) Finalize(ctx context.Context, rev *v1.IstioRevision) error {
